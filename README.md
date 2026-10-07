@@ -1,0 +1,60 @@
+# iam-access-reviewer
+
+A command-line access-review analyzer for IAM account exports, written in
+pure Python 3 (standard library only). It reads a CSV of IAM users/accounts
+and flags risky access patterns — dormant accounts and human accounts
+without MFA — then produces a graded findings report as JSON.
+
+This is a **personal portfolio project** exploring IAM hygiene automation. It
+is a learning exercise, not a production tool, and it has never been deployed
+at any employer. All sample data is fictional.
+
+## Quickstart
+
+No dependencies to install — the standard library is all you need:
+
+```bash
+python3 iam_review.py users.csv
+```
+
+A finding looks like this in the JSON report:
+
+```json
+{
+  "username": "t.nguyen",
+  "check": "no_mfa",
+  "severity": "critical",
+  "detail": "human account without MFA enabled",
+  "days_inactive": null
+}
+```
+
+The exit code is `1` when findings are present and `0` when the export is
+clean, so the reviewer can gate a CI step or a periodic access-review job.
+
+## Checks
+
+- **dormant** — human account with no login in 90+ days (configurable via
+  `--dormant-days`); graded `medium`, or `high` for admin accounts.
+- **no_mfa** — human account without MFA enabled; graded `medium`, or
+  `critical` for admin accounts.
+
+## CSV format
+
+Header row required:
+
+```csv
+username,user_type,last_login,mfa_enabled,policies,owner,owner_active
+j.morrison,human,2026-09-28,true,ReadOnlyAccess,j.morrison@acme.example,true
+svc-deploy,service,,false,AdministratorAccess,platform-team@acme.example,true
+```
+
+`last_login` is `YYYY-MM-DD` (empty = never logged in); `policies` is a
+semicolon-separated list.
+
+## Options
+
+```bash
+python3 iam_review.py users.csv --dormant-days 60 --out report.json
+python3 iam_review.py users.csv --today 2026-10-07   # repeatable reviews
+```
