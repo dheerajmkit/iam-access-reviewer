@@ -1,0 +1,16 @@
+username,user_type,last_login,mfa_enabled,policies,owner,owner_active
+j.morrison,human,2026-09-28,true,ReadOnlyAccess,j.morrison@acme.example,true
+a.patel,human,2026-02-10,true,PowerUserAccess,a.patel@acme.example,true
+svc-deploy,service,,false,AdministratorAccess,platform-team@acme.example,true
+r.okafor,human,2026-09-15,false,ReadOnlyAccess,r.okafor@acme.example,true
+t.nguyen,human,,false,AdministratorAccess,t.nguyen@acme.example,false
+svc-backup,service,,false,s3:GetObject;ec2:DescribeInstances,platform-team@acme.example,true
+d.kim,human,2026-09-20,true,iam:*;s3:*,d.kim@acme.example,true
+svc-monitor,service,2026-09-30,false,CloudWatchReadOnlyAccess,platform-team@acme.example,true
+l.garcia,human,2026-03-22,false,*,l.garcia@acme.example,true
+m.chen,human,2026-09-25,true,ReadOnlyAccess,m.chen@acme.example,false
+svc-etl,service,,false,*,data-team@acme.example,true
+p.sharma,human,2025-11-30,true,ReadOnlyAccess,p.sharma@acme.example,true
+k.jones,human,2026-09-29,true,SecurityAudit,k.jones@acme.example,true
+svc-ci,service,,false,ec2:StartInstances;ec2:StopInstances,platform-team@acme.example,true
+n.wright,human,2026-01-05,false,ViewOnlyAccess,n.wright@acme.example,false

@@ -6,11 +6,15 @@ A command-line access-review analyzer for IAM account exports.
 
 Reads a CSV export of IAM users/accounts and flags risky access patterns:
 
-  * dormant accounts - no interactive login in 90+ days (configurable)
-  * missing MFA       - human accounts without MFA enabled
+  * dormant accounts          - no interactive login in 90+ days (configurable)
+  * missing MFA                - human accounts without MFA enabled
+  * excessive privilege        - admin managed policies, wildcard actions,
+                                 broad managed policies
+  * orphaned accounts          - owner is no longer active
+  * service interactive login  - service accounts with interactive logins
 
-Produces a graded findings report as JSON. Standard library only,
-Python 3.10+.
+Produces a graded findings report as JSON or Markdown. Standard library
+only, Python 3.10+.
 
 CSV format (header row required)::
 
@@ -19,7 +23,8 @@ CSV format (header row required)::
   user_type     human | service
   last_login    YYYY-MM-DD (empty = never logged in)
   mfa_enabled   true | false
-  policies      semicolon-separated policy names, e.g. "ReadOnlyAccess;iam:*"
+  policies      semicolon-separated policy names or action grants,
+                e.g. "ReadOnlyAccess;iam:*"
   owner         account owner (name or email)
   owner_active  true | false (is the owner still with the org?)
 
@@ -40,6 +45,9 @@ DEFAULT_DORMANT_DAYS = 90
 ADMIN_POLICY_NAMES = frozenset(
     {"administratoraccess", "admin", "superuser", "rootaccess"}
 )
+
+# Managed policies that are not full admin but still very broad.
+BROAD_POLICY_NAMES = frozenset({"poweruseraccess"})
 
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
@@ -131,6 +139,11 @@ def is_admin(account: dict) -> bool:
     )
 
 
+def is_wildcard_action(policy: str) -> bool:
+    """True for `*`-style action grants such as `*`, `s3:*`, or `iam:*`."""
+    return policy == "*" or ":*" in policy
+
+
 def check_dormant(
     account: dict, dormant_days: int, today: date
 ) -> dict | None:
@@ -170,7 +183,83 @@ def check_mfa(account: dict) -> dict | None:
     }
 
 
-CHECKS_DAY1 = ("dormant", "no_mfa")
+def check_excessive_privilege(account: dict) -> list[dict]:
+    """Flag admin policies, wildcard action grants, and broad policies."""
+    findings: list[dict] = []
+    policies = account["policies"]
+    no_mfa_human = (
+        account["user_type"] == "human" and not account["mfa_enabled"]
+    )
+
+    admin_policies = sorted(
+        {p for p in policies if p.lower() in ADMIN_POLICY_NAMES}
+    )
+    if admin_policies:
+        findings.append(
+            {
+                "username": account["username"],
+                "check": "excessive_privilege",
+                "severity": "critical" if no_mfa_human else "high",
+                "detail": "administrator policy attached: "
+                + ", ".join(admin_policies),
+                "days_inactive": None,
+            }
+        )
+
+    wildcards = sorted({p for p in policies if is_wildcard_action(p)})
+    if wildcards:
+        findings.append(
+            {
+                "username": account["username"],
+                "check": "excessive_privilege",
+                "severity": "critical" if no_mfa_human else "high",
+                "detail": "wildcard action grant: " + ", ".join(wildcards),
+                "days_inactive": None,
+            }
+        )
+
+    broad = sorted({p for p in policies if p.lower() in BROAD_POLICY_NAMES})
+    if broad:
+        findings.append(
+            {
+                "username": account["username"],
+                "check": "broad_privilege",
+                "severity": "medium",
+                "detail": "broad managed policy attached: " + ", ".join(broad),
+                "days_inactive": None,
+            }
+        )
+    return findings
+
+
+def check_orphaned(account: dict) -> dict | None:
+    """Flag accounts whose owner is no longer active."""
+    if account["owner_active"] or not account["owner"]:
+        return None
+    return {
+        "username": account["username"],
+        "check": "orphaned",
+        "severity": "high" if is_admin(account) else "medium",
+        "detail": f"owner {account['owner']} is no longer active",
+        "days_inactive": None,
+    }
+
+
+def check_service_interactive(account: dict) -> dict | None:
+    """Flag service accounts that have logged in interactively."""
+    if account["user_type"] != "service":
+        return None
+    if account["last_login"] is None:
+        return None
+    return {
+        "username": account["username"],
+        "check": "service_interactive_login",
+        "severity": "high",
+        "detail": "service account logged in interactively on "
+        f"{account['last_login'].isoformat()}; service accounts should "
+        "use machine credentials (access keys / roles), not console logins",
+        "days_inactive": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -186,9 +275,14 @@ def run_review(
     today = today or date.today()
     findings: list[dict] = []
     for account in accounts:
-        findings.append(check_dormant(account, dormant_days, today))
-        findings.append(check_mfa(account))
-    findings = [finding for finding in findings if finding is not None]
+        single = (
+            check_dormant(account, dormant_days, today),
+            check_mfa(account),
+            check_orphaned(account),
+            check_service_interactive(account),
+        )
+        findings.extend(f for f in single if f is not None)
+        findings.extend(check_excessive_privilege(account))
     findings.sort(
         key=lambda f: (
             -SEVERITY_ORDER[f["severity"]],
@@ -212,11 +306,58 @@ def run_review(
     }
 
 
+# ---------------------------------------------------------------------------
+# Report writers
+# ---------------------------------------------------------------------------
+
 def write_json(report: dict, path: str) -> None:
     """Write the report as pretty-printed JSON."""
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
         handle.write("\n")
+
+
+def write_markdown(report: dict, path: str) -> None:
+    """Write the report as a human-readable Markdown access-review document."""
+    lines = [
+        "# IAM Access Review Report",
+        "",
+        f"Generated: {report['generated_at']}",
+        f"Accounts scanned: {report['accounts_scanned']} "
+        f"(dormant threshold: {report['dormant_days']} days)",
+        "",
+        "## Summary",
+        "",
+        "| Severity | Count |",
+        "| --- | --- |",
+    ]
+    summary = report["summary"]
+    for severity in ("critical", "high", "medium", "low"):
+        lines.append(f"| {severity} | {summary[severity]} |")
+    lines += [
+        f"| **total** | **{summary['total_findings']}** |",
+        "",
+        f"Accounts with findings: {summary['accounts_with_findings']} "
+        f"of {report['accounts_scanned']}",
+        "",
+        "## Findings",
+        "",
+    ]
+    if not report["findings"]:
+        lines.append("No findings. All reviewed accounts passed every check.")
+    else:
+        current_severity = None
+        for finding in report["findings"]:
+            if finding["severity"] != current_severity:
+                current_severity = finding["severity"]
+                lines += ["", f"### {current_severity.upper()}", ""]
+            lines.append(
+                f"- **{finding['username']}** [{finding['check']}] — "
+                f"{finding['detail']}"
+            )
+    lines.append("")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +367,8 @@ def write_json(report: dict, path: str) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Analyze an IAM account export (CSV) and flag risky "
-        "access patterns: dormant accounts and missing MFA."
+        "access patterns: dormant accounts, missing MFA, excessive "
+        "privilege, orphaned accounts, and interactive service logins."
     )
     parser.add_argument("csv_file", help="path to the IAM account export CSV")
     parser.add_argument(
@@ -237,9 +379,15 @@ def build_parser() -> argparse.ArgumentParser:
         f"(default: {DEFAULT_DORMANT_DAYS})",
     )
     parser.add_argument(
+        "--format",
+        choices=("json", "md", "markdown"),
+        default="json",
+        help="report format (default: json)",
+    )
+    parser.add_argument(
         "--out",
-        default="iam-review-report.json",
-        help="output report path (default: iam-review-report.json)",
+        default=None,
+        help="output report path (default: iam-review-report.<ext>)",
     )
     parser.add_argument(
         "--today",
@@ -257,6 +405,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--dormant-days must be at least 1")
     today = parse_date(args.today) if args.today else None
 
+    fmt = "md" if args.format == "markdown" else args.format
+    out = args.out or f"iam-review-report.{fmt}"
+
     try:
         accounts = load_accounts(args.csv_file)
     except (OSError, ValueError) as exc:
@@ -266,9 +417,12 @@ def main(argv: list[str] | None = None) -> int:
     report = run_review(accounts, dormant_days=args.dormant_days, today=today)
 
     try:
-        write_json(report, args.out)
+        if fmt == "json":
+            write_json(report, out)
+        else:
+            write_markdown(report, out)
     except OSError as exc:
-        print(f"error: cannot write {args.out}: {exc}", file=sys.stderr)
+        print(f"error: cannot write {out}: {exc}", file=sys.stderr)
         return 2
 
     summary = report["summary"]
@@ -276,7 +430,7 @@ def main(argv: list[str] | None = None) -> int:
         f"scanned {report['accounts_scanned']} accounts, "
         f"{summary['total_findings']} findings "
         f"(critical={summary['critical']}, high={summary['high']}, "
-        f"medium={summary['medium']}, low={summary['low']}) -> {args.out}"
+        f"medium={summary['medium']}, low={summary['low']}) -> {out}"
     )
     return 1 if summary["total_findings"] else 0
 
