@@ -352,3 +352,109 @@ def test_cli_markdown_format(tmp_path):
 
 def test_cli_missing_file():
     assert iam_review.main(["/nonexistent/users.csv"]) == 2
+
+
+# --- executive summary (day 3) ------------------------------------------------
+
+def test_executive_summary_contents():
+    accounts = iam_review.load_accounts(SAMPLE_CSV)
+    report = iam_review.run_review(accounts, dormant_days=90, today=TODAY)
+    summary = report["executive_summary"]
+    assert summary["accounts_scanned"] == 15
+    assert summary["accounts_with_findings"] == 11
+    assert summary["total_findings"] == 19
+    assert summary["critical_and_high"] == 9
+    assert summary["counts_by_check"]["dormant"] == 5
+    assert summary["counts_by_check"]["excessive_privilege"] == 5
+    assert len(summary["top_risks"]) == 3
+    # top risks are the highest-severity findings, in report order
+    assert summary["top_risks"][0]["severity"] == "critical"
+    assert summary["top_risks"][0]["username"] == "l.garcia"
+    assert len(summary["recommended_actions"]) > 0
+    assert any("MFA" in action for action in summary["recommended_actions"])
+
+
+def test_executive_summary_clean_report():
+    report = iam_review.run_review([], today=TODAY)
+    summary = report["executive_summary"]
+    assert summary["total_findings"] == 0
+    assert summary["top_risks"] == []
+    assert summary["recommended_actions"] == []
+
+
+# --- CSV export (day 3) ---------------------------------------------------------
+
+def test_write_csv_roundtrip(tmp_path):
+    import csv
+
+    accounts = iam_review.load_accounts(SAMPLE_CSV)
+    report = iam_review.run_review(accounts, dormant_days=90, today=TODAY)
+    out = str(tmp_path / "findings.csv")
+    iam_review.write_csv(report, out)
+    with open(out, newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 19
+    assert set(rows[0].keys()) == {
+        "username",
+        "check",
+        "severity",
+        "detail",
+        "days_inactive",
+    }
+    assert rows[0]["severity"] == "critical"  # sorted first
+
+
+def test_write_markdown_has_executive_summary(tmp_path):
+    accounts = iam_review.load_accounts(SAMPLE_CSV)
+    report = iam_review.run_review(accounts, dormant_days=90, today=TODAY)
+    out = str(tmp_path / "report.md")
+    iam_review.write_markdown(report, out)
+    text = open(out).read()
+    assert "## Executive Summary" in text
+    assert "### Top risks" in text
+    assert "### Recommended actions" in text
+    assert "### Findings by check" in text
+
+
+def test_cli_csv_format(tmp_path):
+    out = str(tmp_path / "findings.csv")
+    code = iam_review.main(
+        [SAMPLE_CSV, "--today", "2026-10-07", "--format", "csv", "--out", out]
+    )
+    assert code == 1
+    assert open(out).read().splitlines()[0].startswith("username,check")
+
+
+def test_cli_all_formats(tmp_path):
+    code = iam_review.main(
+        [
+            SAMPLE_CSV,
+            "--today",
+            "2026-10-07",
+            "--format",
+            "all",
+            "--out",
+            str(tmp_path / "review"),
+        ]
+    )
+    assert code == 1
+    assert os.path.exists(str(tmp_path / "review.json"))
+    assert os.path.exists(str(tmp_path / "review.md"))
+    assert os.path.exists(str(tmp_path / "review.csv"))
+
+
+def test_resolve_outputs():
+    assert iam_review.resolve_outputs("json", None) == [
+        ("json", "iam-review-report.json")
+    ]
+    assert iam_review.resolve_outputs("md", "r.md") == [("md", "r.md")]
+    assert iam_review.resolve_outputs("all", None) == [
+        ("json", "iam-review-report.json"),
+        ("md", "iam-review-report.md"),
+        ("csv", "iam-review-report.csv"),
+    ]
+    assert iam_review.resolve_outputs("all", "out/review") == [
+        ("json", "out/review.json"),
+        ("md", "out/review.md"),
+        ("csv", "out/review.csv"),
+    ]

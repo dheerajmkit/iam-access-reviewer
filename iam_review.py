@@ -13,8 +13,9 @@ Reads a CSV export of IAM users/accounts and flags risky access patterns:
   * orphaned accounts          - owner is no longer active
   * service interactive login  - service accounts with interactive logins
 
-Produces a graded findings report as JSON or Markdown. Standard library
-only, Python 3.10+.
+Produces a graded findings report as JSON, Markdown, or CSV, each with an
+executive summary (top risks, findings by check type, recommended actions).
+Standard library only, Python 3.10+.
 
 CSV format (header row required)::
 
@@ -36,6 +37,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 from datetime import date, datetime
 
@@ -50,6 +52,21 @@ ADMIN_POLICY_NAMES = frozenset(
 BROAD_POLICY_NAMES = frozenset({"poweruseraccess"})
 
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+# Remediation guidance surfaced in the executive summary, keyed by check.
+RECOMMENDED_ACTIONS = {
+    "dormant": "Disable or remove dormant accounts after owner confirmation; "
+    "require periodic access re-certification.",
+    "no_mfa": "Enforce MFA for all human accounts; block console access for "
+    "accounts without MFA.",
+    "excessive_privilege": "Replace administrator and wildcard grants with "
+    "scoped least-privilege policies.",
+    "broad_privilege": "Review broad managed policies (e.g. PowerUserAccess) "
+    "and scope them down where possible.",
+    "orphaned": "Reassign or deprovision accounts whose owners have departed.",
+    "service_interactive_login": "Move service accounts to machine "
+    "credentials (access keys / IAM roles) and disable console access.",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +283,40 @@ def check_service_interactive(account: dict) -> dict | None:
 # Review engine
 # ---------------------------------------------------------------------------
 
+def build_executive_summary(report: dict) -> dict:
+    """Build the leadership-facing summary: top risks and remediations."""
+    findings = report["findings"]
+    summary = report["summary"]
+    counts_by_check: dict[str, int] = {}
+    for finding in findings:
+        counts_by_check[finding["check"]] = (
+            counts_by_check.get(finding["check"], 0) + 1
+        )
+    top_risks = [
+        {
+            "username": finding["username"],
+            "check": finding["check"],
+            "severity": finding["severity"],
+            "detail": finding["detail"],
+        }
+        for finding in findings[:3]
+    ]
+    recommended_actions: list[str] = []
+    for finding in findings:
+        action = RECOMMENDED_ACTIONS.get(finding["check"])
+        if action and action not in recommended_actions:
+            recommended_actions.append(action)
+    return {
+        "accounts_scanned": report["accounts_scanned"],
+        "accounts_with_findings": summary["accounts_with_findings"],
+        "total_findings": summary["total_findings"],
+        "critical_and_high": summary["critical"] + summary["high"],
+        "counts_by_check": counts_by_check,
+        "top_risks": top_risks,
+        "recommended_actions": recommended_actions,
+    }
+
+
 def run_review(
     accounts: list[dict],
     dormant_days: int = DEFAULT_DORMANT_DAYS,
@@ -297,13 +348,15 @@ def run_review(
     summary["accounts_with_findings"] = len(
         {finding["username"] for finding in findings}
     )
-    return {
+    report = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "accounts_scanned": len(accounts),
         "dormant_days": dormant_days,
         "summary": summary,
         "findings": findings,
     }
+    report["executive_summary"] = build_executive_summary(report)
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -317,8 +370,31 @@ def write_json(report: dict, path: str) -> None:
         handle.write("\n")
 
 
+def write_csv(report: dict, path: str) -> None:
+    """Write the findings as CSV (one row per finding)."""
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            ["username", "check", "severity", "detail", "days_inactive"]
+        )
+        for finding in report["findings"]:
+            writer.writerow(
+                [
+                    finding["username"],
+                    finding["check"],
+                    finding["severity"],
+                    finding["detail"],
+                    finding["days_inactive"]
+                    if finding["days_inactive"] is not None
+                    else "",
+                ]
+            )
+
+
 def write_markdown(report: dict, path: str) -> None:
     """Write the report as a human-readable Markdown access-review document."""
+    summary = report["summary"]
+    exec_summary = report["executive_summary"]
     lines = [
         "# IAM Access Review Report",
         "",
@@ -326,19 +402,50 @@ def write_markdown(report: dict, path: str) -> None:
         f"Accounts scanned: {report['accounts_scanned']} "
         f"(dormant threshold: {report['dormant_days']} days)",
         "",
+        "## Executive Summary",
+        "",
+        f"{exec_summary['accounts_with_findings']} of "
+        f"{exec_summary['accounts_scanned']} accounts have findings "
+        f"({exec_summary['total_findings']} total, "
+        f"{exec_summary['critical_and_high']} critical/high).",
+        "",
+        "### Top risks",
+        "",
+    ]
+    if not exec_summary["top_risks"]:
+        lines.append("No material risks identified.")
+    else:
+        for i, risk in enumerate(exec_summary["top_risks"], start=1):
+            lines.append(
+                f"{i}. **{risk['username']}** [{risk['severity']}/"
+                f"{risk['check']}] — {risk['detail']}"
+            )
+    lines += ["", "### Recommended actions", ""]
+    if not exec_summary["recommended_actions"]:
+        lines.append("No remediation actions required.")
+    else:
+        for action in exec_summary["recommended_actions"]:
+            lines.append(f"- {action}")
+    lines += [
+        "",
         "## Summary",
         "",
         "| Severity | Count |",
         "| --- | --- |",
     ]
-    summary = report["summary"]
     for severity in ("critical", "high", "medium", "low"):
         lines.append(f"| {severity} | {summary[severity]} |")
     lines += [
         f"| **total** | **{summary['total_findings']}** |",
         "",
-        f"Accounts with findings: {summary['accounts_with_findings']} "
-        f"of {report['accounts_scanned']}",
+        "### Findings by check",
+        "",
+        "| Check | Count |",
+        "| --- | --- |",
+    ]
+    for check, count in sorted(exec_summary["counts_by_check"].items()):
+        lines.append(f"| {check} | {count} |")
+    lines += [
         "",
         "## Findings",
         "",
@@ -364,6 +471,9 @@ def write_markdown(report: dict, path: str) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+REPORT_FORMATS = ("json", "md", "csv")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Analyze an IAM account export (CSV) and flag risky "
@@ -380,14 +490,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--format",
-        choices=("json", "md", "markdown"),
+        choices=("json", "md", "markdown", "csv", "all"),
         default="json",
-        help="report format (default: json)",
+        help="report format: json, md, csv, or all (default: json)",
     )
     parser.add_argument(
         "--out",
         default=None,
-        help="output report path (default: iam-review-report.<ext>)",
+        help="output report path (default: iam-review-report.<ext>; with "
+        "--format all, the extension is replaced per format)",
     )
     parser.add_argument(
         "--today",
@@ -395,6 +506,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="override 'today' as YYYY-MM-DD (for repeatable reviews)",
     )
     return parser
+
+
+def resolve_outputs(fmt: str, out: str | None) -> list[tuple[str, str]]:
+    """Map --format/--out to a list of (format, path) pairs to write."""
+    formats = list(REPORT_FORMATS) if fmt == "all" else [fmt]
+    outputs = []
+    for one in formats:
+        if out and fmt != "all":
+            path = out
+        else:
+            base = os.path.splitext(out)[0] if out else "iam-review-report"
+            path = f"{base}.{one}"
+        outputs.append((one, path))
+    return outputs
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -406,7 +531,7 @@ def main(argv: list[str] | None = None) -> int:
     today = parse_date(args.today) if args.today else None
 
     fmt = "md" if args.format == "markdown" else args.format
-    out = args.out or f"iam-review-report.{fmt}"
+    outputs = resolve_outputs(fmt, args.out)
 
     try:
         accounts = load_accounts(args.csv_file)
@@ -416,13 +541,14 @@ def main(argv: list[str] | None = None) -> int:
 
     report = run_review(accounts, dormant_days=args.dormant_days, today=today)
 
+    writers = {"json": write_json, "md": write_markdown, "csv": write_csv}
+    written = []
     try:
-        if fmt == "json":
-            write_json(report, out)
-        else:
-            write_markdown(report, out)
+        for one, path in outputs:
+            writers[one](report, path)
+            written.append(path)
     except OSError as exc:
-        print(f"error: cannot write {out}: {exc}", file=sys.stderr)
+        print(f"error: cannot write report: {exc}", file=sys.stderr)
         return 2
 
     summary = report["summary"]
@@ -430,7 +556,8 @@ def main(argv: list[str] | None = None) -> int:
         f"scanned {report['accounts_scanned']} accounts, "
         f"{summary['total_findings']} findings "
         f"(critical={summary['critical']}, high={summary['high']}, "
-        f"medium={summary['medium']}, low={summary['low']}) -> {out}"
+        f"medium={summary['medium']}, low={summary['low']}) -> "
+        + ", ".join(written)
     )
     return 1 if summary["total_findings"] else 0
 
